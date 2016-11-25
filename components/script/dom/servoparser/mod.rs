@@ -33,6 +33,7 @@ use profile_traits::time::{TimerMetadataReflowType, ProfilerCategory, profile};
 use script_thread::ScriptThread;
 use servo_url::ServoUrl;
 use std::cell::Cell;
+use std::mem;
 use util::resource_files::read_resource_file;
 
 mod html;
@@ -46,9 +47,12 @@ pub struct ServoParser {
     /// The pipeline associated with this parse, unavailable if this parse
     /// does not correspond to a page load.
     pipeline: Option<PipelineId>,
-    /// Input chunks received but not yet passed to the parser.
+    /// Input received from network.
     #[ignore_heap_size_of = "Defined in html5ever"]
-    pending_input: DOMRefCell<BufferQueue>,
+    network_input: DOMRefCell<BufferQueue>,
+    /// Input received from script. Used only to support document.write().
+    #[ignore_heap_size_of = "Defined in html5ever"]
+    script_input: DOMRefCell<BufferQueue>,
     /// The tokenizer of this parser.
     tokenizer: DOMRefCell<Tokenizer>,
     /// Whether to expect any further input from the associated network request.
@@ -136,6 +140,54 @@ impl ServoParser {
         parser.parse_chunk(String::from(input));
     }
 
+    pub fn document(&self) -> &Document {
+        &self.document
+    }
+
+    pub fn pipeline(&self) -> Option<PipelineId> {
+        self.pipeline
+    }
+
+    pub fn script_nesting_level(&self) -> usize {
+        self.script_nesting_level.get()
+    }
+
+    pub fn write(&self, text: Vec<DOMString>) {
+        assert!(self.script_nesting_level.get() > 0);
+
+        for chunk in text {
+            self.script_input.borrow_mut().push_back(String::from(chunk).into());
+        }
+
+        if self.document.get_pending_parsing_blocking_script().is_some() {
+            return;
+        }
+
+        loop {
+            let script = match self.tokenizer.borrow_mut().feed(&mut *self.script_input.borrow_mut()) {
+                Ok(()) => return,
+                Err(script) => script,
+            };
+
+            let script_nesting_level = self.script_nesting_level.get();
+
+            self.script_nesting_level.set(script_nesting_level + 1);
+            script.prepare();
+            self.script_nesting_level.set(script_nesting_level);
+
+            if self.document.get_pending_parsing_blocking_script().is_some() {
+                assert!(self.suspended.get());
+                return;
+            }
+
+            assert!(!self.suspended.get());
+
+            if !self.script_input.borrow().is_empty() {
+                return;
+            }
+        }
+    }
+
     #[allow(unrooted_must_root)]
     fn new_inherited(
             document: &Document,
@@ -147,7 +199,8 @@ impl ServoParser {
             reflector: Reflector::new(),
             document: JS::from_ref(document),
             pipeline: pipeline,
-            pending_input: DOMRefCell::new(BufferQueue::new()),
+            network_input: DOMRefCell::new(BufferQueue::new()),
+            script_input: DOMRefCell::new(BufferQueue::new()),
             tokenizer: DOMRefCell::new(tokenizer),
             last_chunk_received: Cell::new(last_chunk_state == LastChunkState::Received),
             suspended: Default::default(),
@@ -168,20 +221,12 @@ impl ServoParser {
             ServoParserBinding::Wrap)
     }
 
-    pub fn document(&self) -> &Document {
-        &self.document
-    }
-
-    pub fn pipeline(&self) -> Option<PipelineId> {
-        self.pipeline
-    }
-
     fn has_pending_input(&self) -> bool {
-        !self.pending_input.borrow().is_empty()
+        !self.network_input.borrow().is_empty()
     }
 
     fn push_input_chunk(&self, chunk: String) {
-        self.pending_input.borrow_mut().push_back(chunk.into());
+        self.network_input.borrow_mut().push_back(chunk.into());
     }
 
     fn last_chunk_received(&self) -> bool {
@@ -215,6 +260,11 @@ impl ServoParser {
         assert!(self.suspended.get());
         self.suspended.set(false);
 
+        mem::swap(&mut *self.script_input.borrow_mut(), &mut *self.network_input.borrow_mut());
+        while let Some(chunk) = self.script_input.borrow_mut().pop_front() {
+            self.network_input.borrow_mut().push_back(chunk);
+        }
+
         let script_nesting_level = self.script_nesting_level.get();
         assert_eq!(script_nesting_level, 0);
 
@@ -241,11 +291,12 @@ impl ServoParser {
     }
 
     fn do_parse_sync(&self) {
+        assert!(self.script_input.borrow().is_empty());
         // This parser will continue to parse while there is either pending input or
         // the parser remains unsuspended.
         loop {
             self.document().reflow_if_reflow_timer_expired();
-            let script = match self.tokenizer.borrow_mut().feed(&mut *self.pending_input.borrow_mut()) {
+            let script = match self.tokenizer.borrow_mut().feed(&mut *self.network_input.borrow_mut()) {
                 Ok(()) => break,
                 Err(script) => script,
             };
